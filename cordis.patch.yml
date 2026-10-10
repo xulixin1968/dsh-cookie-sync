@@ -1,0 +1,13 @@
+- insert:
+    - id: cookie-sync
+      name: dsh-cookie-sync
+      config:
+        edgeProfilePath: ''
+        autoSyncDomains:
+          - github.com
+          - raw.githubusercontent.com
+          - api.github.com
+          - localhost
+          - 127.0.0.1
+        syncOnNavigate: true
+        maxCookiesPerDomain: 50
