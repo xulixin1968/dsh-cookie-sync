@@ -1,0 +1,33 @@
+{
+  "name": "dsh-cookie-sync",
+  "version": "1.0.0",
+  "description": "Sync cookies from Edge browser to DSH sidebar browser, avoiding repeated logins on supported sites.",
+  "type": "module",
+  "main": "./index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cookie",
+    "sync",
+    "edge",
+    "browser",
+    "login",
+    "session"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0"
+  }
+}
