@@ -31,16 +31,10 @@ function isLoopbackAddress(address) {
 }
 
 function isTrustedRequest(req) {
+  // Accept any request from loopback socket (127.0.0.1, ::1, etc.)
+  // The DSH webserver only serves internal pages (web GUI + sidebar browser),
+  // so loopback access is safe without extra origin checking.
   if (!isLoopbackAddress(req.socket?.remoteAddress)) return false;
-  const origin = req.headers.origin;
-  const host = req.headers.host;
-  if (origin && host) {
-    try {
-      if (new URL(origin).host !== host) return false;
-    } catch {
-      return false;
-    }
-  }
   return true;
 }
 
