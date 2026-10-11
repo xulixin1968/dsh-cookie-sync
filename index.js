@@ -8,8 +8,8 @@
  * Cordis plugin contract: named exports `name`, `inject`, `apply`.
  */
 
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
@@ -72,6 +72,78 @@ function decryptDpapi(encryptedBuffer) {
 
 // ── cookie extraction from Edge SQLite ───────────────────────────────
 
+// ── locked-file snapshot ─────────────────────────────────────────────
+//
+// Edge holds its cookie database with FILE_SHARE_NONE while running, so neither
+// copyFileSync nor DatabaseSync(readOnly) can touch it (EBUSY / "unable to open
+// database file"). Windows allows a handle to be opened with an explicit share
+// mask, and Chromium relaxes that mask when a browser is shutting down, so try
+// increasingly permissive readers: Node's fs, then a pwsh FileShare.ReadWrite
+// copy, then a plain copy. Whatever wins, we read a throwaway snapshot which is
+// deleted in the caller's finally block, so no cookie data lands on disk.
+function snapshotViaPwsh(src, dest) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const ps =
+      "$ErrorActionPreference='Stop';" +
+      "$s=[IO.File]::Open(" + psQuote(src) + ",[IO.FileMode]::Open,[IO.FileAccess]::Read," +
+      "[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete);" +
+      "try{$d=[IO.File]::Create(" + psQuote(dest) + ");" +
+      "try{$b=New-Object byte[] 1048576;" +
+      "while(($n=$s.Read($b,0,$b.Length)) -gt 0){$d.Write($b,0,$n)}}finally{$d.Close()}}finally{$s.Close()}";
+    const child = spawn("pwsh", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+      timeout: 20000,
+      windowsHide: true,
+    });
+    const err = [];
+    let settled = false;
+    child.stdout.on("data", () => {});
+    child.stderr.on("data", (d) => err.push(d));
+    child.on("close", (code) => {
+      settled = true;
+      if (code === 0) resolvePromise(true);
+      else rejectPromise(new Error(Buffer.concat(err).toString().trim() || "pwsh copy failed"));
+    });
+    // a late 'error' after 'close' must not re-reject an already-settled promise
+    child.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      rejectPromise(e);
+    });
+  });
+}
+
+function psQuote(value) {
+  return "'" + String(value).replace(/'/g, "''") + "'";
+}
+
+async function snapshotLockedFile(src, dest) {
+  try {
+    copyFileSync(src, dest);
+    return statSync(dest).size;
+  } catch {
+    /* Edge locks the file; fall through to the more permissive readers */
+  }
+  try {
+    await snapshotViaPwsh(src, dest);
+    return statSync(dest).size;
+  } catch {
+    /* still locked; fall through to the last resort below */
+  }
+  try {
+    copyFileSync(src, dest);
+    return statSync(dest).size;
+  } catch (err) {
+    const e = new Error(
+      "Edge is running and holds an exclusive lock on its cookie database. " +
+        "Quit Edge (or its background processes) and retry, or set edgeCookiePath " +
+        "to a browser profile that is not currently open. Underlying error: " +
+        (err?.message ?? err)
+    );
+    e.code = "EDGE_DB_LOCKED";
+    throw e;
+  }
+}
+
 async function readEdgeCookiesForHost(cookieDbPath, host) {
   if (!existsSync(cookieDbPath)) {
     throw new Error("Edge cookie database not found at: " + cookieDbPath);
@@ -82,24 +154,77 @@ async function readEdgeCookiesForHost(cookieDbPath, host) {
   } catch {
     throw new Error("node:sqlite is not available; this plugin requires Node 22+");
   }
-  const db = new DatabaseSync(cookieDbPath, { readOnly: true });
+
+  // Snapshot the live cookie store (and any WAL sidecar) into a temp dir so
+  // SQLite never touches the file Edge has locked. The snapshot is deleted in
+  // the finally block, so no cookie data is ever left on disk.
+  const snapshotDir = mkdtempSync(join(tmpdir(), "cookie-sync-"));
+  const snapshotPath = join(snapshotDir, "Cookies");
   try {
+    await snapshotLockedFile(cookieDbPath, snapshotPath);
+    // WAL may hold rows not yet checkpointed into the main file.
+    const walPath = cookieDbPath + "-wal";
+    if (existsSync(walPath)) {
+      try {
+        await snapshotLockedFile(walPath, snapshotPath + "-wal");
+      } catch {
+        /* checkpointed already; the main snapshot is sufficient */
+      }
+    }
+  } catch (err) {
+    rmSync(snapshotDir, { recursive: true, force: true });
+    if (err?.code === "EDGE_DB_LOCKED") throw err; // keep the classification
+    const e = new Error("failed to snapshot Edge cookie database: " + (err?.message ?? err));
+    e.code = "SNAPSHOT_FAILED";
+    throw e;
+  }
+
+  let db;
+  try {
+    db = new DatabaseSync(snapshotPath, { readOnly: true });
+  } catch (err) {
+    rmSync(snapshotDir, { recursive: true, force: true });
+    // SQLite cannot open even the snapshot (antivirus/indexer holding it, or a
+    // truncated copy from a browser writing mid-read). Classify as a lock so
+    // the route reports "retry later" rather than a hard failure.
+    const e = new Error(
+      "cookie snapshot could not be opened (file busy or incomplete); retry once Edge finishes writing. " +
+        "Underlying error: " + (err?.message ?? err)
+    );
+    e.code = "EDGE_DB_LOCKED";
+    throw e;
+  }
+  try {
+    // Two 64-bit columns break node:sqlite's JS number conversion:
+    //  - encrypted_value is a BLOB that can exceed Number.MAX_SAFE_INTEGER
+    //  - expires_utc is a microsecond timestamp in the same range
+    // Read both as text in SQL and convert explicitly.
     const rows = db
       .prepare(
-        "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly FROM cookies WHERE host_key = ? OR host_key LIKE ?"
+        "SELECT host_key, name, value, " +
+          "hex(encrypted_value) AS enc_hex, length(encrypted_value) AS enc_len, " +
+          "path, CAST(expires_utc AS TEXT) AS expires_text, is_secure, is_httponly " +
+          "FROM cookies WHERE host_key = ? OR host_key LIKE ?"
       )
       .all(host, "%." + host);
     const cookies = [];
+    let locked = 0;
     for (const row of rows) {
       let value = row.value || "";
-      if (!value && row.encrypted_value && row.encrypted_value.length > 0) {
+      if (!value && row.enc_hex && row.enc_len > 0) {
         try {
-          value = await decryptDpapi(row.encrypted_value);
+          value = await decryptDpapi(Buffer.from(row.enc_hex, "hex"));
         } catch {
-          continue; // skip cookies we cannot decrypt
+          // Chromium 127+ stores cookies with app-bound encryption: the
+          // ciphertext is bound to the Edge binary and Windows DPAPI refuses it
+          // for every other process. That is a browser security boundary we
+          // cannot and must not circumvent.
+          locked++;
+          continue;
         }
       }
       if (!value) continue;
+      const expiresUtc = Number(row.expires_text ?? 0);
       cookies.push({
         domain: row.host_key,
         name: row.name,
@@ -108,14 +233,26 @@ async function readEdgeCookiesForHost(cookieDbPath, host) {
         secure: !!row.is_secure,
         httpOnly: !!row.is_httponly,
         expirationDate:
-          row.expires_utc > 0
-            ? Math.floor(row.expires_utc / 1000000 - 11644473600)
+          Number.isFinite(expiresUtc) && expiresUtc > 0
+            ? Math.floor(expiresUtc / 1000000 - 11644473600)
             : Math.floor(Date.now() / 1000) + 3600,
       });
+    }
+    if (cookies.length === 0 && locked > 0) {
+      const e = new Error(
+        "All " + locked + " matching cookies are protected by Chromium app-bound encryption " +
+          "(Edge 127+). Their values can only be decrypted by Edge itself, so external " +
+          "processes cannot read them. Use the plugin with a browser/profile that stores " +
+          "unencrypted cookies, or sign in to the target site inside the DSH sidebar."
+      );
+      e.code = "APP_BOUND_ENCRYPTION";
+      throw e;
     }
     return cookies;
   } finally {
     db.close();
+    // never leave decrypted-adjacent copies of the cookie store on disk
+    rmSync(snapshotDir, { recursive: true, force: true });
   }
 }
 
@@ -166,6 +303,27 @@ export function apply(ctx, config = {}) {
       const limited = cookies.slice(0, maxCookiesPerDomain);
       writeJson(res, 200, { cookies: limited, synced: true, count: limited.length });
     } catch (err) {
+      // A running Edge locks its cookie store with FILE_SHARE_NONE. That is a
+      // browser security boundary, not a plugin fault, so report it as a normal
+      // "nothing to sync yet" outcome instead of a server error.
+      if (err?.code === "EDGE_DB_LOCKED") {
+        writeJson(res, 200, {
+          cookies: [],
+          synced: false,
+          code: "EDGE_DB_LOCKED",
+          reason: "Edge is running; quit Edge to allow cookie sync.",
+        });
+        return;
+      }
+      if (err?.code === "APP_BOUND_ENCRYPTION") {
+        writeJson(res, 200, {
+          cookies: [],
+          synced: false,
+          code: "APP_BOUND_ENCRYPTION",
+          reason: err.message,
+        });
+        return;
+      }
       writeJson(res, 500, { error: err?.message ?? String(err), synced: false });
     }
   };
